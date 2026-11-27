@@ -1,0 +1,8 @@
+#!/bin/sh
+# Optional Xfce panel item (Generic Monitor plugin): h-bar icon + unread count; click opens the window.
+n=$(cat "$HOME/.cache/physics-digest/unread" 2>/dev/null || echo 0)
+echo "<img>$HOME/.local/share/icons/physics-digest-panel.svg</img>"
+[ "${n:-0}" -gt 0 ] 2>/dev/null && echo "<txt> $n</txt>" || echo "<txt></txt>"
+echo "<click>$HOME/.local/bin/physics-digest</click>"
+echo "<txtclick>$HOME/.local/bin/physics-digest</txtclick>"
+echo "<tool>Physics Digest: ${n:-0} unread</tool>"

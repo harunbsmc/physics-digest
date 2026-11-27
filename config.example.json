@@ -1,0 +1,38 @@
+{
+  "profile": "Describe yourself in a few sentences: your field, level and research topics, and what else you are curious about. Claude uses this to pick and explain papers for you.",
+
+  "arxiv_categories": ["hep-th", "quant-ph"],
+
+  "keywords": {
+    "core": [],
+    "broad": [
+      "black hole", "entanglement entropy", "quantum gravity", "holograph", "ads/cft",
+      "scattering amplitude", "bootstrap", "generalized symmetr", "anomal", "topological order",
+      "bell", "nonlocality", "quantum error correction", "quantum computing", "decoherence"
+    ],
+    "accessible": [
+      "review", "lecture notes", "introduction to", "pedagogical", "tutorial", "primer", "overview"
+    ],
+    "related": [
+      "effective field theor", "conformal field", "gauge theor", "renormaliz", "entanglement"
+    ]
+  },
+  "authors": [],
+  "min_score": 2,
+
+  "news_feeds": {
+    "Quanta Magazine": "https://www.quantamagazine.org/feed/",
+    "APS Physics": "https://feeds.aps.org/rss/recent/physics.xml"
+  },
+
+  "claude_summary": true,
+  "claude_picks": 5,
+  "claude_pool": 200,
+  "foryou_per_day": 3,
+  "news_per_day": 2,
+
+  "check_every_hours": 3,
+  "startup_delay_seconds": 60,
+  "papers_dir": "~/Papers",
+  "ask_claude_url": "https://claude.ai/new?q={prompt}"
+}

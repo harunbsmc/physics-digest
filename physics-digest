@@ -1,0 +1,1469 @@
+#!/usr/bin/env python3
+"""Physics Digest - a daily, Claude-curated digest of new arXiv papers and physics news for the Linux desktop.
+
+  physics-digest               open the window
+  physics-digest --tab NAME    open the window on a tab: picks, foryou, news, saved
+  physics-digest --show ID     open the window on one item
+  physics-digest --daemon      background service: checks feeds and sends notifications (used at login)
+  physics-digest --refresh     ask the background service to check now
+  physics-digest --quit        stop the background service
+  physics-digest --fetch-once  fetch once in the terminal and print what was found
+  physics-digest --version     print the version
+  physics-digest --restore     bring back everything you deleted from the latest day's items
+  physics-digest --reset       forget everything (also deleted items) and start completely fresh
+"""
+import html, json, os, re, shutil, sqlite3, subprocess, sys, threading, time
+import urllib.parse, urllib.request
+import xml.etree.ElementTree as ET
+
+HOME = os.path.expanduser("~")
+CONF = os.path.join(HOME, ".config/physics-digest/config.json")
+DB = os.path.join(HOME, ".local/share/physics-digest/items.db")
+__version__ = "1.0.0"
+ICON = os.path.join(HOME, ".local/share/icons/physics-digest.svg")
+CACHE = os.path.join(HOME, ".cache/physics-digest")
+SELF = os.path.realpath(__file__)
+BUS_NAME, BUS_PATH = "org.physicsdigest.PhysicsDigest.Daemon", "/org/physicsdigest/PhysicsDigest/Daemon"
+os.environ["PATH"] = os.path.join(HOME, ".local/bin") + ":" + os.environ.get("PATH", "")
+
+DEFAULTS = {
+    "arxiv_categories": ["hep-th", "quant-ph"],
+    "keywords": {"core": [], "broad": [], "accessible": [], "related": []},
+    "min_score": 2,
+    "authors": [],
+    "news_feeds": {},
+    "profile": "A physics graduate student working on quantum field theory.",
+    "claude_summary": False,
+    "claude_picks": 5,
+    "foryou_per_day": 3,
+    "news_per_day": 2,
+    "papers_dir": "~/Papers",
+    "ask_claude_url": "https://claude.ai/new?q={prompt}",
+    "claude_pool": 200,
+    "check_every_hours": 3,
+    "startup_delay_seconds": 60,
+    "max_news_notifications": 3,
+}
+
+
+def load_conf():
+    cfg = dict(DEFAULTS)
+    try:
+        with open(CONF) as f:
+            cfg.update(json.load(f))
+    except Exception:
+        pass
+    return cfg
+
+
+# ----------------------------------------------------------------- storage
+TAB_WHERE = {
+    "picks": "kind='paper' AND pick=1",
+    "foryou": "kind='paper' AND featured=1",
+    "news": "kind='news'",
+    "saved": "saved=1",
+}
+
+class Store:
+    def __init__(self, path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        self.lock = threading.Lock()
+        self.db = sqlite3.connect(path, check_same_thread=False)
+        self.db.row_factory = sqlite3.Row
+        self.db.executescript("""
+            CREATE TABLE IF NOT EXISTS items(
+                id TEXT PRIMARY KEY, kind TEXT, source TEXT, title TEXT, link TEXT,
+                authors TEXT DEFAULT '', summary TEXT DEFAULT '', score INTEGER DEFAULT 0,
+                tags TEXT DEFAULT '', pick INTEGER DEFAULT 0, why TEXT DEFAULT '',
+                level TEXT DEFAULT '', added REAL, read INTEGER DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
+        """)
+        for col, typ in (("featured", "INTEGER DEFAULT 0"), ("dismissed", "INTEGER DEFAULT 0"),
+                         ("saved", "INTEGER DEFAULT 0"), ("note", "TEXT DEFAULT ''"),
+                         ("explain", "TEXT DEFAULT ''"), ("bibtex", "TEXT DEFAULT ''")):
+            try:
+                self.db.execute(f"ALTER TABLE items ADD COLUMN {col} {typ}")
+            except sqlite3.OperationalError:
+                pass
+        self.db.commit()
+
+    def add(self, d):
+        with self.lock:
+            cur = self.db.execute(
+                "INSERT OR IGNORE INTO items(id,kind,source,title,link,authors,summary,score,tags,added,read)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (d["id"], d["kind"], d.get("source", ""), d.get("title", ""), d.get("link", ""),
+                 d.get("authors", ""), d.get("summary", ""), d.get("score", 0),
+                 ", ".join(d.get("tags", [])), time.time(), 1 if d.get("archived") else 0))
+            self.db.commit()
+            return cur.rowcount == 1
+
+    def set_pick(self, item_id, why, level):
+        with self.lock:
+            self.db.execute("UPDATE items SET pick=1, why=?, level=? WHERE id=?", (why, level, item_id))
+            self.db.commit()
+
+    def set_featured(self, item_id):
+        with self.lock:
+            self.db.execute("UPDATE items SET featured=1 WHERE id=?", (item_id,))
+            self.db.commit()
+
+    def mark_read(self, item_id):
+        with self.lock:
+            self.db.execute("UPDATE items SET read=1 WHERE id=?", (item_id,))
+            self.db.commit()
+
+    def dismiss(self, item_id):
+        with self.lock:
+            self.db.execute("UPDATE items SET dismissed=1, read=1, saved=0 WHERE id=?", (item_id,))
+            self.db.commit()
+
+    def set_field(self, item_id, field, value):
+        assert field in ("saved", "note", "explain", "bibtex")
+        with self.lock:
+            self.db.execute(f"UPDATE items SET {field}=? WHERE id=?", (value, item_id))
+            self.db.commit()
+
+    SURFACED = "(pick=1 OR featured=1 OR kind='news')"
+
+    def _latest_day_bounds(self):
+        r = self.db.execute(f"SELECT MAX(added) FROM items WHERE {self.SURFACED}").fetchone()[0]
+        if not r:
+            return None
+        t = time.localtime(r)
+        start = time.mktime((t.tm_year, t.tm_mon, t.tm_mday, 0, 0, 0, 0, 0, -1))
+        return start, start + 86400
+
+    def deleted_in_latest(self):
+        with self.lock:
+            b = self._latest_day_bounds()
+            if not b:
+                return 0
+            return self.db.execute(
+                f"SELECT COUNT(*) FROM items WHERE dismissed=1 AND {self.SURFACED} AND added>=? AND added<?",
+                b).fetchone()[0]
+
+    def restore_latest(self):
+        """Bring back everything deleted from the most recent day's items, as unread."""
+        with self.lock:
+            b = self._latest_day_bounds()
+            if not b:
+                return 0
+            cur = self.db.execute(
+                f"UPDATE items SET dismissed=0, read=0 WHERE dismissed=1 AND {self.SURFACED} "
+                "AND added>=? AND added<?", b)
+            self.db.commit()
+            return cur.rowcount
+
+    def get(self, item_id):
+        with self.lock:
+            return self.db.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
+
+    def tab_counts(self):
+        with self.lock:
+            return {tab: self.db.execute(
+                f"SELECT COUNT(*) FROM items WHERE read=0 AND dismissed=0 AND {TAB_WHERE[tab]}").fetchone()[0]
+                for tab in TAB_WHERE}
+
+    def mark_all_read(self):
+        with self.lock:
+            self.db.execute("UPDATE items SET read=1")
+            self.db.commit()
+
+    def unread(self, min_score):
+        with self.lock:
+            return self.db.execute(
+                "SELECT COUNT(*) FROM items WHERE read=0 AND dismissed=0 AND (kind='news' OR pick=1 OR featured=1)"
+            ).fetchone()[0]
+
+    def query(self, tab, search, min_score=0):
+        where = TAB_WHERE[tab] + " AND dismissed=0"
+        args = []
+        if search:
+            where += " AND (title LIKE ? OR summary LIKE ? OR authors LIKE ? OR tags LIKE ? OR note LIKE ?)"
+            args = ["%" + search + "%"] * 5
+        order = "CAST(added/86400 AS INTEGER) DESC, pick DESC, score DESC, added DESC"
+        with self.lock:
+            return self.db.execute(
+                f"SELECT * FROM items WHERE {where} ORDER BY {order} LIMIT 300", args).fetchall()
+
+    def get_meta(self, key, default=None):
+        with self.lock:
+            r = self.db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return r[0] if r else default
+
+    def set_meta(self, key, value):
+        with self.lock:
+            self.db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", (key, str(value)))
+            self.db.commit()
+
+    def prune(self):
+        """Forget ordinary papers after 30 days; keep picks, matches and news for a year (saved/noted forever)."""
+        now = time.time()
+        with self.lock:
+            self.db.execute("DELETE FROM items WHERE kind='paper' AND pick=0 AND score<2 AND saved=0 "
+                            "AND note='' AND added<?", (now - 30 * 86400,))
+            self.db.execute("DELETE FROM items WHERE saved=0 AND note='' AND added<?", (now - 365 * 86400,))
+            self.db.commit()
+
+
+def write_unread(store, cfg):
+    """The panel item reads this tiny file instead of starting Python."""
+    os.makedirs(CACHE, exist_ok=True)
+    tmp = os.path.join(CACHE, "unread.tmp")
+    with open(tmp, "w") as f:
+        f.write(str(store.unread(cfg["min_score"])))
+    os.replace(tmp, os.path.join(CACHE, "unread"))
+
+
+def locked_fetch(cfg, store, log=print):
+    """Run one fetch unless another one (window or service) is already running."""
+    import fcntl
+    os.makedirs(CACHE, exist_ok=True)
+    lf = open(os.path.join(CACHE, "fetch.lock"), "w")
+    try:
+        fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return None
+    try:
+        return run_fetch(cfg, store, log)
+    finally:
+        fcntl.flock(lf, fcntl.LOCK_UN)
+        lf.close()
+
+
+# ----------------------------------------------------------------- fetching
+def fetch(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "physics-digest/1.0"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return r.read()
+
+
+def local(tag):
+    return tag.rsplit("}", 1)[-1]
+
+
+def feed_items(xml_bytes):
+    root = ET.fromstring(xml_bytes)
+    for el in root.iter():
+        if local(el.tag) not in ("item", "entry"):
+            continue
+        d = {}
+        for ch in el:
+            name = local(ch.tag)
+            if name == "link" and ch.get("href"):
+                d.setdefault("link", ch.get("href"))
+            elif ch.text:
+                d.setdefault(name, ch.text.strip())
+        yield d
+
+
+def clean(s):
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html.unescape(s or ""))).strip()
+
+
+def norm(t):
+    return re.sub(r"[\u2010-\u2015\u2212]", "-", (t or "").lower())
+
+
+def run_fetch(cfg, store, log=print):
+    new = {"papers": [], "news": [], "picks": [], "featured": []}
+    kw = cfg.get("keywords", {})
+    tiers = {"core": 3, "broad": 2, "accessible": 2, "related": 1}
+    if isinstance(kw, list):
+        kw = {"related": kw}
+    weighted = [(norm(k), w) for t, w in tiers.items() for k in kw.get(t, [])]
+
+    # arXiv
+    for cat in cfg["arxiv_categories"]:
+        try:
+            data = fetch(f"https://rss.arxiv.org/rss/{cat}")
+        except Exception as e:
+            log(f"arXiv {cat}: {e}")
+            continue
+        for it in feed_items(data):
+            link = it.get("link", "")
+            desc = clean(it.get("description", ""))
+            kind = (it.get("announce_type") or "").lower()
+            if not kind:
+                m = re.search(r"Announce Type:\s*(\S+)", desc)
+                kind = m.group(1).lower() if m else "new"
+            if kind not in ("new", "cross") or not link:
+                continue
+            title = clean(it.get("title", ""))
+            abstract = desc.split("Abstract:", 1)[-1].strip()
+            authors = clean(it.get("creator", ""))
+            text = norm(title + " " + abstract)
+            tags, score = [], 0
+            for k, w in weighted:
+                if k in text:
+                    tags.append(k)
+                    score += w
+            for a in cfg.get("authors", []):
+                if norm(a) in norm(authors):
+                    tags.append(a)
+                    score += 4
+            d = dict(id=link, kind="paper", source=cat, title=title, link=link, authors=authors,
+                     summary=abstract, score=score, tags=tags)
+            if store.add(d):
+                new["papers"].append(d)
+
+    # Claude picks
+    if cfg.get("claude_summary") and new["papers"] and shutil.which("claude"):
+        pool = sorted(new["papers"], key=lambda p: -p["score"])[: cfg["claude_pool"]]
+        listing = "\n".join(f"[{i+1}] ({p['source']}) {p['title']} :: {p['summary'][:250]}"
+                            for i, p in enumerate(pool))
+        n = cfg["claude_picks"]
+        prompt = (
+            "Researcher profile: " + cfg["profile"] + "\n\n"
+            f"Below are today's new arXiv papers. Pick the {n} most interesting ones for this person. "
+            "Do not only pick papers close to their own research: also include conceptually interesting "
+            "papers in their fields with a new idea, a surprising result, or a good review or lecture notes, "
+            "that someone with their background can follow. Always include papers directly related to their "
+            "research if there are any.\n"
+            "Write exactly one line per pick in this format and nothing else:\n"
+            "N | Why it is interesting (1-2 sentences, English) | Easy/Medium/Advanced\n\n" + listing)
+        try:
+            r = subprocess.run(["claude", "-p", prompt], capture_output=True, text=True, timeout=600)
+            for line in r.stdout.splitlines():
+                parts = [x.strip() for x in line.split("|")]
+                if len(parts) >= 3 and parts[0].strip("[]. ").isdigit():
+                    i = int(parts[0].strip("[]. ")) - 1
+                    if 0 <= i < len(pool):
+                        level = parts[-1].replace("Level:", "").strip()
+                        store.set_pick(pool[i]["id"], parts[1], level)
+                        new["picks"].append(dict(pool[i], why=parts[1], level=level))
+        except Exception as e:
+            log(f"claude: {e}")
+
+    # "For you": the best few keyword matches that are not already picks
+    picked = {p["id"] for p in new["picks"]}
+    matched = sorted((p for p in new["papers"] if p["score"] >= cfg["min_score"] and p["id"] not in picked),
+                     key=lambda p: -p["score"])
+    new["featured"] = matched[: cfg["foryou_per_day"]]
+    for p in new["featured"]:
+        store.set_featured(p["id"])
+
+    # news: only a couple a day stay unread, the rest go straight to the archive
+    today = time.strftime("%Y-%m-%d")
+    if store.get_meta("news_day") != today:
+        store.set_meta("news_day", today)
+        store.set_meta("news_count", 0)
+    news_left = cfg["news_per_day"] - int(store.get_meta("news_count", 0) or 0)
+    for name, url in cfg.get("news_feeds", {}).items():
+        try:
+            data = fetch(url)
+        except Exception as e:
+            log(f"{name}: {e}")
+            continue
+        for it in list(feed_items(data))[:15]:
+            nid = it.get("link") or it.get("guid") or it.get("id")
+            if not nid:
+                continue
+            d = dict(id=nid, kind="news", source=name, title=clean(it.get("title", "")),
+                     link=it.get("link", nid),
+                     summary=clean(it.get("description") or it.get("summary") or "")[:400],
+                     archived=news_left <= 0)
+            if store.add(d) and news_left > 0:
+                new["news"].append(d)
+                news_left -= 1
+    store.set_meta("news_count", cfg["news_per_day"] - max(news_left, 0))
+
+    store.set_meta("last_fetch", time.time())
+    store.prune()
+    return new
+
+
+# ----------------------------------------------------------------- background service
+def main_daemon():
+    from gi.repository import GLib, Gio
+    cfg = load_conf()
+    store = Store(DB)
+    loop = GLib.MainLoop()
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION)
+    state = {"owned": False, "fetching": False}
+    actions = {}
+
+    def log(m):
+        print(m, file=sys.stderr, flush=True)
+
+    # single instance + tiny control interface (Refresh / Quit)
+    xml = ("<node><interface name='org.physicsdigest.PhysicsDigest.Daemon'>"
+           "<method name='Refresh'/><method name='Quit'/></interface></node>")
+    iface = Gio.DBusNodeInfo.new_for_xml(xml).interfaces[0]
+
+    def on_call(conn, sender, path, iname, method, params, inv):
+        if method == "Refresh":
+            refresh()
+        elif method == "Quit":
+            GLib.idle_add(loop.quit)
+        inv.return_value(None)
+
+    def on_acquired(conn, name):
+        state["owned"] = True
+
+    def on_lost(conn, name):
+        if not state["owned"]:
+            log("Physics Digest service is already running.")
+        loop.quit()
+
+    bus.register_object(BUS_PATH, iface, on_call, None, None)
+    Gio.bus_own_name_on_connection(bus, BUS_NAME, Gio.BusNameOwnerFlags.NONE, on_acquired, on_lost)
+
+    # notifications straight over D-Bus (no GTK, no libnotify)
+    def on_signal(conn, sender, path, iname, signal, params):
+        if signal == "ActionInvoked":
+            nid, _key = params.unpack()
+            fn = actions.pop(nid, None)
+            if fn:
+                fn()
+        elif signal == "NotificationClosed":
+            actions.pop(params.unpack()[0], None)
+
+    bus.signal_subscribe("org.freedesktop.Notifications", "org.freedesktop.Notifications", None,
+                         "/org/freedesktop/Notifications", None, Gio.DBusSignalFlags.NONE, on_signal)
+
+    def notify(summary, body, fn):
+        icon = ICON if os.path.exists(ICON) else "accessories-dictionary"
+        try:
+            res = bus.call_sync(
+                "org.freedesktop.Notifications", "/org/freedesktop/Notifications",
+                "org.freedesktop.Notifications", "Notify",
+                GLib.Variant("(susssasa{sv}i)", ("Physics Digest", 0, icon, summary, body,
+                                                 ["default", "Open"], {}, -1)),
+                GLib.VariantType("(u)"), Gio.DBusCallFlags.NONE, -1, None)
+            actions[res.unpack()[0]] = fn
+        except Exception as e:
+            log(f"notify: {e}")
+
+    def launch(*args):
+        os.makedirs(CACHE, exist_ok=True)
+        with open(os.path.join(CACHE, "window.log"), "a") as logf:
+            subprocess.Popen([sys.executable, SELF, *args], start_new_session=True,
+                             stdout=logf, stderr=logf)
+
+    def open_window(tab):
+        launch("--tab", tab)
+
+    def open_item(item_id, link=None):
+        launch("--show", item_id)
+
+    def announce(res):
+        if res["picks"]:
+            body = "\n".join("• " + p["title"][:90] for p in res["picks"][:5])
+            notify(f"Today's picks: {len(res['picks'])} papers", body, lambda: open_window("picks"))
+        elif res["featured"]:
+            body = "\n".join("• " + p["title"][:90] for p in res["featured"])
+            notify(f"{len(res['featured'])} new papers for you", body, lambda: open_window("foryou"))
+        for nw in res["news"][: cfg["max_news_notifications"]]:
+            notify(nw["source"], nw["title"], lambda nw=nw: open_item(nw["id"], nw["link"]))
+
+    def done(res):
+        state["fetching"] = False
+        if res:
+            announce(res)
+        write_unread(store, cfg)
+        return False
+
+    def worker():
+        try:
+            res = locked_fetch(cfg, Store(DB), log)
+        except Exception as e:
+            log(f"fetch failed: {e}")
+            res = None
+        GLib.idle_add(done, res)
+
+    def refresh():
+        nonlocal cfg
+        if state["fetching"]:
+            return
+        state["fetching"] = True
+        cfg = load_conf()
+        threading.Thread(target=worker, daemon=True).start()
+
+    def tick():
+        last = float(store.get_meta("last_fetch", 0) or 0)
+        if time.time() - last >= cfg["check_every_hours"] * 3600:
+            refresh()
+        else:
+            write_unread(store, cfg)
+        return True
+
+    write_unread(store, cfg)
+    GLib.timeout_add_seconds(int(cfg["startup_delay_seconds"]), lambda: tick() and False)
+    GLib.timeout_add_seconds(15 * 60, tick)
+    loop.run()
+
+
+def call_daemon(method):
+    from gi.repository import Gio
+    try:
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION)
+        bus.call_sync(BUS_NAME, BUS_PATH, BUS_NAME, method, None, None,
+                      Gio.DBusCallFlags.NO_AUTO_START, 5000, None)
+        return True
+    except Exception:
+        return False
+
+
+# ----------------------------------------------------------------- LaTeX -> readable text
+GREEK = {n: c for n, c in zip(
+    "alpha beta gamma delta epsilon varepsilon zeta eta theta vartheta iota kappa lambda mu nu xi pi varpi rho varrho sigma varsigma tau upsilon phi varphi chi psi omega Gamma Delta Theta Lambda Xi Pi Sigma Upsilon Phi Psi Omega".split(),
+    "αβγδϵεζηθϑικλμνξπϖρϱσςτυϕφχψωΓΔΘΛΞΠΣΥΦΨΩ")}
+SYM = {"otimes":"⊗","oplus":"⊕","times":"×","cdot":"·","cdots":"⋯","ldots":"…","dots":"…","approx":"≈","simeq":"≃",
+       "sim":"∼","leq":"≤","le":"≤","geq":"≥","ge":"≥","neq":"≠","ne":"≠","equiv":"≡","propto":"∝","infty":"∞","partial":"∂",
+       "nabla":"∇","hbar":"ħ","to":"→","rightarrow":"→","leftarrow":"←","Rightarrow":"⇒","leftrightarrow":"↔","mapsto":"↦",
+       "pm":"±","mp":"∓","langle":"⟨","rangle":"⟩","dagger":"†","ell":"ℓ","sum":"∑","prod":"∏","int":"∫","oint":"∮",
+       "in":"∈","notin":"∉","subset":"⊂","subseteq":"⊆","cup":"∪","cap":"∩","forall":"∀","exists":"∃","emptyset":"∅",
+       "star":"⋆","circ":"∘","wedge":"∧","vee":"∨","perp":"⊥","parallel":"∥","sqrt":"√","degree":"°","prime":"′",
+       "lesssim":"≲","gtrsim":"≳","ll":"≪","gg":"≫","Re":"Re","Im":"Im","log":"log","ln":"ln","exp":"exp","sin":"sin",
+       "cos":"cos","tan":"tan","det":"det","tr":"tr","Tr":"Tr","min":"min","max":"max","lim":"lim","mathrm":"","quad":"  ","qquad":"    "}
+BB = dict(zip("CRZNQHP", "ℂℝℤℕℚℍℙ"))
+SUP = str.maketrans("0123456789+-=()niajk", "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾ⁿⁱᵃʲᵏ")
+SUB = str.maketrans("0123456789+-=()aeoxijklmnprstuv", "₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎ₐₑₒₓᵢⱼₖₗₘₙₚᵣₛₜᵤᵥ")
+MATH = re.compile(r"\$\$(.+?)\$\$|\$(.+?)\$|\\\((.+?)\\\)|\\\[(.+?)\\\]", re.S)
+
+def _group(s, i):
+    """Return (content, next index) for {...} or a single token at s[i]."""
+    if i < len(s) and s[i] == "{":
+        depth, j = 0, i
+        while j < len(s):
+            depth += {"{": 1, "}": -1}.get(s[j], 0)
+            if depth == 0:
+                return s[i+1:j], j + 1
+            j += 1
+        return s[i+1:], len(s)
+    if i < len(s) and s[i] == "\\":
+        m = re.match(r"\\[A-Za-z]+", s[i:])
+        if m:
+            return m.group(0), i + len(m.group(0))
+    return s[i:i+1], i + 1
+
+def tex_to_markup(tex):
+    """LaTeX math -> Pango markup (Unicode symbols, <sup>/<sub>)."""
+    out, i = [], 0
+    while i < len(tex):
+        c = tex[i]
+        if c == "\\":
+            m = re.match(r"\\([A-Za-z]+)|\\(.)", tex[i:])
+            name = m.group(1) or m.group(2)
+            i += len(m.group(0))
+            if name in ("mathbb", "mathbbm"):
+                g, i = _group(tex, i); out.append("".join(BB.get(ch, ch) for ch in g))
+            elif name in ("mathrm", "text", "mathit", "mathbf", "mathcal", "mathsf", "operatorname", "textrm", "mathfrak"):
+                g, i = _group(tex, i); out.append(tex_to_markup(g))
+            elif name in ("frac", "dfrac", "tfrac"):
+                a, i = _group(tex, i); b, i = _group(tex, i)
+                a, b = tex_to_markup(a), tex_to_markup(b)
+                wrap = lambda x: f"({x})" if re.search(r"[+\-\s]", re.sub(r"<[^>]+>", "", x)) else x
+                out.append(f"{wrap(a)}/{wrap(b)}")
+            elif name == "sqrt":
+                g, i = _group(tex, i); g = tex_to_markup(g)
+                out.append("√" + (g if len(re.sub(r"<[^>]+>", "", g)) == 1 else f"({g})"))
+            elif name in ("left", "right", "big", "Big", "bigg", "Bigg", "displaystyle", "limits", "nonumber"):
+                pass
+            elif name in ("bar", "overline"):
+                g, i = _group(tex, i); out.append(tex_to_markup(g) + "\u0305")
+            elif name in ("hat", "widehat"):
+                g, i = _group(tex, i); out.append(tex_to_markup(g) + "\u0302")
+            elif name in ("tilde", "widetilde"):
+                g, i = _group(tex, i); out.append(tex_to_markup(g) + "\u0303")
+            elif name in ("vec",):
+                g, i = _group(tex, i); out.append(tex_to_markup(g) + "\u20d7")
+            elif name == "dot":
+                g, i = _group(tex, i); out.append(tex_to_markup(g) + "\u0307")
+            elif name in (",", ";", ":", " ", "!"):
+                out.append("" if name == "!" else "\u2009")
+            elif name in ("{", "}", "%", "&", "#", "_", "$"):
+                out.append(html.escape(name))
+            elif name in GREEK:
+                out.append(GREEK[name])
+            elif name in SYM:
+                out.append(SYM[name])
+            else:
+                out.append(html.escape(name))
+        elif c in "^_":
+            g, i = _group(tex, i + 1)
+            inner = tex_to_markup(g)
+            plain = re.sub(r"<[^>]+>", "", inner)
+            table = SUP if c == "^" else SUB
+            conv = plain.translate(table)
+            if all(ch != o or ch in " " for ch, o in zip(conv, plain)) and "&" not in inner and "<" not in inner:
+                out.append(conv)
+            else:
+                tag = "sup" if c == "^" else "sub"
+                out.append(f"<{tag}>{inner}</{tag}>")
+        elif c in "{}":
+            i += 1
+        else:
+            out.append(html.escape(c)); i += 1
+    return "".join(out)
+
+def text_to_markup(text):
+    """Plain text with $...$ math -> Pango markup."""
+    res, last = [], 0
+    for m in MATH.finditer(text):
+        res.append(html.escape(text[last:m.start()]))
+        tex = next(g for g in m.groups() if g is not None)
+        res.append(tex_to_markup(tex))
+        last = m.end()
+    res.append(html.escape(text[last:]))
+    return "".join(res)
+
+
+# ----------------------------------------------------------------- window
+def arxiv_id(link):
+    m = re.match(r"https?://arxiv\.org/abs/([^?#]+)", link or "")
+    return m.group(1) if m else None
+
+
+def fallback_bibtex(it):
+    aid = arxiv_id(it["link"]) or ""
+    authors = " and ".join(a.strip() for a in (it["authors"] or "").split(",") if a.strip())
+    first = (authors.split(" and ")[0].split()[-1] if authors else "anon").lower()
+    year = "20" + aid[:2] if re.match(r"\d{4}\.", aid) else time.strftime("%Y")
+    key = re.sub(r"[^a-z]", "", first) + year
+    return (f"@misc{{{key},\n  title = {{{it['title']}}},\n  author = {{{authors}}},\n  year = {{{year}}},\n"
+            f"  eprint = {{{aid}}},\n  archivePrefix = {{arXiv}},\n  primaryClass = {{{it['source']}}}\n}}")
+
+
+def main_gui():
+    import gi
+    gi.require_version("Gtk", "3.0")
+    from gi.repository import Gtk, Gdk, Gio, GLib, Pango
+
+    TABS = [("picks", "Picks"), ("foryou", "For you"), ("news", "News"), ("saved", "Saved")]
+    EMPTY = {
+        "picks": "No picks yet.\nClaude chooses a few papers once a day, after arXiv's daily update.",
+        "foryou": "Nothing new for you yet.\nThe best keyword matches of the day appear here.",
+        "news": "No news yet.\nA couple of stories a day from your news sources.",
+        "saved": "Nothing saved yet.\nPress the star (or S) on anything you want to keep for later.",
+    }
+    CSS = b"""
+    .dg-title { font-size: 1.3em; font-weight: bold; }
+    .dg-section { font-weight: bold; margin-top: 14px; }
+    .dg-row { padding: 2px 0 2px 10px; border-left: 3px solid transparent; }
+    .dg-unread { border-left-color: @theme_selected_bg_color; }
+    .dg-unread .dg-rtitle { font-weight: bold; }
+    .dg-read .dg-rtitle, .dg-read .dg-rpreview { opacity: 0.6; }
+    .dg-icon { opacity: 0.4; min-width: 24px; min-height: 24px; padding: 2px; }
+    .dg-icon:hover, .dg-on { opacity: 1; }
+    .dg-level { font-size: 0.8em; font-weight: bold; border-radius: 4px; padding: 0 6px; color: #2E3440; }
+    .dg-easy { background-color: #A3BE8C; }
+    .dg-medium { background-color: #EBCB8B; }
+    .dg-advanced { background-color: #D08770; }
+    .dg-body text { background-color: transparent; }
+    .dg-body { font-size: 1.05em; background-color: transparent; }
+    .dg-day { font-size: 0.85em; font-weight: bold; opacity: 0.55; padding: 10px 0 4px 13px; }
+    .dg-note { font-size: 1.0em; }
+    stackswitcher button { min-width: 0; padding-left: 14px; padding-right: 14px; }
+    list row:selected { background-color: alpha(@theme_fg_color, 0.07); }
+    list row:selected label { color: @theme_fg_color; }
+    list row:selected .dim-label { opacity: 0.55; }
+    """
+    MAX_W = 760
+    KEYS_HELP = ("j/k  move    Enter  open    s  save    o  arXiv    p  PDF    e  explain    "
+                 "b  BibTeX    a  ask Claude    Del  delete    Esc  back")
+
+    def label(text="", markup=None, wrap=True, dim=False, cls=None, select=False, lines=0):
+        l = Gtk.Label(xalign=0)
+        if markup is not None:
+            l.set_markup(markup)
+        else:
+            l.set_text(text)
+        if wrap:
+            l.set_line_wrap(True)
+            l.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        if lines:
+            l.set_lines(lines)
+            l.set_ellipsize(Pango.EllipsizeMode.END)
+        if dim:
+            l.get_style_context().add_class("dim-label")
+        if cls:
+            l.get_style_context().add_class(cls)
+        l.set_selectable(select)
+        return l
+
+    class Clamp(Gtk.Bin):
+        """Centres its child in a column of at most max_w pixels, without forcing the window wider."""
+        __gtype_name__ = "PhysicsDigestClamp"
+
+        def __init__(self, child, max_w):
+            super().__init__()
+            self.max_w = max_w
+            self.add(child)
+
+        def do_get_request_mode(self):
+            return Gtk.SizeRequestMode.HEIGHT_FOR_WIDTH
+
+        def do_get_preferred_width(self):
+            mn, nat = self.get_child().get_preferred_width()
+            return mn, max(mn, min(nat, self.max_w))
+
+        def _inner(self, width):
+            mn, _ = self.get_child().get_preferred_width()
+            return max(mn, min(width, self.max_w))
+
+        def do_get_preferred_height_for_width(self, width):
+            return self.get_child().get_preferred_height_for_width(self._inner(width))
+
+        def do_get_preferred_height(self):
+            return self.get_child().get_preferred_height_for_width(self.max_w)
+
+        def do_get_preferred_width_for_height(self, height):
+            return self.do_get_preferred_width()
+
+        def do_size_allocate(self, alloc):
+            self.set_allocation(alloc)
+            w = self._inner(alloc.width)
+            child = Gdk.Rectangle()
+            child.x = alloc.x + (alloc.width - w) // 2
+            child.y = alloc.y
+            child.width = w
+            child.height = alloc.height
+            self.get_child().size_allocate(child)
+
+    def level_pill(level):
+        l = Gtk.Label(label=level)
+        l.get_style_context().add_class("dg-level")
+        if level.lower() in ("easy", "medium", "advanced"):
+            l.get_style_context().add_class("dg-" + level.lower())
+        l.set_valign(Gtk.Align.CENTER)
+        return l
+
+    def icon_button(name, tip):
+        b = Gtk.Button.new_from_icon_name(name, Gtk.IconSize.BUTTON)
+        b.set_relief(Gtk.ReliefStyle.NONE)
+        b.set_valign(Gtk.Align.CENTER)
+        b.set_tooltip_text(tip)
+        b.get_style_context().add_class("dg-icon")
+        return b
+
+    def meta_text(it):
+        parts = [it["source"]]
+        if it["authors"]:
+            parts.append(it["authors"][:110])
+        if it["note"]:
+            parts.append("✎ note")
+        return "  ·  ".join(parts)
+
+    def day_label(ts):
+        d = time.localtime(ts)
+        today = time.localtime()
+        days = (time.mktime((today.tm_year, today.tm_mon, today.tm_mday, 0, 0, 0, 0, 0, -1)) -
+                time.mktime((d.tm_year, d.tm_mon, d.tm_mday, 0, 0, 0, 0, 0, -1))) // 86400
+        if days <= 0:
+            return "Today"
+        if days == 1:
+            return "Yesterday"
+        return time.strftime("%A, %d %B", d)
+
+    _math_cache = {}
+
+    def render_math(tex, color, size_pt):
+        key = (tex, color, size_pt)
+        if key in _math_cache:
+            return _math_cache[key]
+        res = None
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import numpy as np
+            from matplotlib import mathtext, font_manager
+            from gi.repository import GdkPixbuf
+            matplotlib.rcParams["mathtext.fontset"] = "cm"
+            t = re.sub(r"\\text\{", r"\\mathrm{", tex)
+            t = re.sub(r"\\operatorname\{", r"\\mathrm{", t)
+            r = mathtext.MathTextParser("agg").parse(f"${t}$", dpi=96,
+                                                     prop=font_manager.FontProperties(size=size_pt))
+            alpha = np.asarray(r.image, dtype=np.uint8)
+            h, w = alpha.shape
+            rgba = np.zeros((h, w, 4), dtype=np.uint8)
+            rgba[..., 0], rgba[..., 1], rgba[..., 2] = (int(color[i:i + 2], 16) for i in (1, 3, 5))
+            rgba[..., 3] = alpha
+            pix = GdkPixbuf.Pixbuf.new_from_bytes(GLib.Bytes.new(rgba.tobytes()), GdkPixbuf.Colorspace.RGB,
+                                                  True, 8, w, h, w * 4)
+            res = (pix, int(round(r.depth)))
+        except Exception:
+            res = None
+        _math_cache[key] = res
+        return res
+
+    def run_bg(work, done):
+        """Run work() in a thread, then done(result) on the GTK thread."""
+        def t():
+            try:
+                r = work()
+            except Exception as e:
+                r = e
+            GLib.idle_add(lambda: done(r) and False)
+        threading.Thread(target=t, daemon=True).start()
+
+    class DigestWindow(Gtk.ApplicationWindow):
+        def __init__(self, app):
+            super().__init__(application=app, title="Physics Digest")
+            self.app = app
+            self.current = None
+            self.fetching = False
+            self.set_default_size(840, 680)
+            try:
+                self.set_icon_from_file(ICON)
+            except Exception:
+                self.set_icon_name("accessories-dictionary")
+            prov = Gtk.CssProvider()
+            prov.load_from_data(CSS)
+            Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), prov,
+                                                     Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+            self.pages = Gtk.Stack()
+            self.pages.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
+            self.pages.set_transition_duration(150)
+            self.add(self.pages)
+            self.pages.add_named(self.build_list_page(), "list")
+            self.pages.add_named(self.build_detail_page(), "detail")
+            self.connect("key-press-event", self.on_key)
+            self.show_all()
+            self.pages.set_visible_child_name("list")
+            self.reload()
+
+        # ================================================================ list
+        def build_list_page(self):
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+            box.set_border_width(10)
+            bar = Gtk.Box(spacing=8)
+            self.tabs = Gtk.Stack()
+            self.tabs.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
+            switcher = Gtk.StackSwitcher(stack=self.tabs)
+            switcher.set_homogeneous(False)
+            bar.pack_start(switcher, False, False, 0)
+            self.search = Gtk.SearchEntry(placeholder_text="Search")
+            self.search.set_width_chars(12)
+            self.search.connect("search-changed", lambda *_: self.reload())
+            bar.pack_end(self.search, False, False, 0)
+            box.pack_start(bar, False, False, 0)
+
+            self.lists, self.placeholders = {}, {}
+            for key, title in TABS:
+                lb = Gtk.ListBox()
+                lb.set_selection_mode(Gtk.SelectionMode.BROWSE)
+                lb.connect("row-activated", lambda _lb, row: self.show_detail(row.item_id))
+                lb.set_header_func(self.day_header, None)
+                ph = label(EMPTY[key], dim=True)
+                ph.set_justify(Gtk.Justification.CENTER)
+                ph.set_xalign(0.5)
+                ph.set_margin_top(60)
+                ph.show()
+                lb.set_placeholder(ph)
+                sw = Gtk.ScrolledWindow()
+                sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+                sw.add(Clamp(lb, MAX_W))
+                self.tabs.add_titled(sw, key, title)
+                self.lists[key], self.placeholders[key] = lb, ph
+            self.tabs.connect("notify::visible-child-name", lambda *_: self.reload())
+            box.pack_start(self.tabs, True, True, 0)
+
+            foot = Gtk.Box(spacing=8)
+            self.status = label(dim=True, wrap=False)
+            self.status.set_ellipsize(Pango.EllipsizeMode.END)
+            foot.pack_start(self.status, True, True, 0)
+            keys = icon_button("input-keyboard-symbolic", KEYS_HELP)
+            foot.pack_start(keys, False, False, 0)
+            self.spinner = Gtk.Spinner()
+            foot.pack_start(self.spinner, False, False, 0)
+            b_read = Gtk.Button(label="Mark all read")
+            b_read.connect("clicked", lambda *_: (self.app.store.mark_all_read(), self.reload()))
+            foot.pack_end(b_read, False, False, 0)
+            self.b_restore = Gtk.Button(label="Restore")
+            self.b_restore.set_tooltip_text("Bring back everything you deleted from the latest day's items")
+            self.b_restore.connect("clicked", lambda *_: self.restore())
+            foot.pack_end(self.b_restore, False, False, 0)
+            self.b_refresh = Gtk.Button(label="Refresh")
+            self.b_refresh.set_tooltip_text("Check for new papers and news (Ctrl+R)")
+            self.b_refresh.connect("clicked", lambda *_: self.refresh())
+            foot.pack_end(self.b_refresh, False, False, 0)
+            box.pack_start(foot, False, False, 0)
+            return box
+
+        def day_header(self, row, before, _data):
+            d = day_label(row.added)
+            if before is None or day_label(before.added) != d:
+                row.set_header(label(d, cls="dg-day", wrap=False))
+            else:
+                row.set_header(None)
+
+        def make_row(self, it):
+            row = Gtk.ListBoxRow()
+            row.item_id, row.added = it["id"], it["added"]
+            h = Gtk.Box(spacing=8)
+            h.get_style_context().add_class("dg-row")
+            h.get_style_context().add_class("dg-read" if it["read"] else "dg-unread")
+            for m in ("top", "bottom"):
+                getattr(h, f"set_margin_{m}")(7)
+            h.set_margin_end(4)
+            v = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+            v.pack_start(label(markup=text_to_markup(it["title"] or "(untitled)"), cls="dg-rtitle"), False, False, 0)
+            mrow = Gtk.Box(spacing=8)
+            if it["level"]:
+                mrow.pack_start(level_pill(it["level"]), False, False, 0)
+            mrow.pack_start(label(markup="<small>" + GLib.markup_escape_text(meta_text(it)) + "</small>",
+                                  dim=True, lines=1), True, True, 0)
+            v.pack_start(mrow, False, False, 0)
+            preview = it["why"] or it["summary"]
+            if preview:
+                v.pack_start(label(markup=text_to_markup(preview[:400]), lines=2, cls="dg-rpreview"), False, False, 0)
+            h.pack_start(v, True, True, 0)
+            star = icon_button("starred-symbolic" if it["saved"] else "non-starred-symbolic",
+                               "Unsave (S)" if it["saved"] else "Save for later (S)")
+            if it["saved"]:
+                star.get_style_context().add_class("dg-on")
+            star.connect("clicked", lambda *_: self.toggle_save(it["id"]))
+            dele = icon_button("user-trash-symbolic", "Delete (Del)")
+            dele.connect("clicked", lambda *_: self.delete(it["id"]))
+            h.pack_end(dele, False, False, 0)
+            h.pack_end(star, False, False, 0)
+            row.add(h)
+            row.show_all()
+            return row
+
+        def reload(self, keep=None):
+            key = self.tabs.get_visible_child_name() or "picks"
+            lb = self.lists[key]
+            sel = keep or (lb.get_selected_row().item_id if lb.get_selected_row() else None)
+            for child in lb.get_children():
+                lb.remove(child)
+            target = None
+            for it in self.app.store.query(key, self.search.get_text().strip()):
+                row = self.make_row(it)
+                lb.add(row)
+                if it["id"] == sel:
+                    target = row
+            if target is None and lb.get_children() and not self.search.has_focus():
+                target = lb.get_children()[0]
+            if target:
+                lb.select_row(target)
+                if not self.in_detail() and not self.search.has_focus():
+                    target.grab_focus()
+            if key != "saved" and self.app.store.deleted_in_latest() > 0:
+                self.placeholders[key].set_text("Nothing left here.\nUse “Restore” to bring back the latest items you deleted.")
+            else:
+                self.placeholders[key].set_text(EMPTY[key])
+            self.update_status()
+
+        def update_status(self, note=None):
+            last = self.app.store.get_meta("last_fetch")
+            when = time.strftime("%d %b %H:%M", time.localtime(float(last))) if last else "never"
+            n = self.app.store.unread(0)
+            text = f"Last checked {when}  ·  {n} unread"
+            self.status.set_text(f"{note}  ·  {text}" if note else text)
+            write_unread(self.app.store, self.app.cfg)
+            self.spinner.start() if self.fetching else self.spinner.stop()
+            self.b_refresh.set_sensitive(not self.fetching)
+            self.b_restore.set_sensitive(self.app.store.deleted_in_latest() > 0)
+
+        def current_list(self):
+            return self.lists[self.tabs.get_visible_child_name()]
+
+        def move(self, step):
+            lb = self.current_list()
+            rows = lb.get_children()
+            if not rows:
+                return
+            cur = lb.get_selected_row()
+            i = rows.index(cur) + step if cur in rows else 0
+            row = rows[max(0, min(len(rows) - 1, i))]
+            lb.select_row(row)
+            row.grab_focus()
+
+        # ================================================================ detail
+        def build_detail_page(self):
+            outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+            outer.set_border_width(10)
+            top = Gtk.Box(spacing=8)
+            back = Gtk.Button.new_with_label("←  Back")
+            back.set_tooltip_text("Back to the list (Esc)")
+            back.connect("clicked", lambda *_: self.show_list())
+            top.pack_start(back, False, False, 0)
+            self.d_delete = Gtk.Button.new_with_label("Delete")
+            self.d_delete.set_tooltip_text("Delete (Del)")
+            self.d_delete.connect("clicked", lambda *_: self.current and self.delete(self.current["id"]))
+            top.pack_end(self.d_delete, False, False, 0)
+            self.d_save = Gtk.Button()
+            self.d_save.connect("clicked", lambda *_: self.current and self.toggle_save(self.current["id"]))
+            top.pack_end(self.d_save, False, False, 0)
+            outer.pack_start(top, False, False, 0)
+
+            sw = Gtk.ScrolledWindow()
+            sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+            body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            body.set_margin_top(6)
+            body.set_margin_bottom(12)
+            self.d_title = label(cls="dg-title", select=True)
+            self.d_metabox = Gtk.Box(spacing=8)
+            self.d_meta = label(dim=True, select=True)
+            self.d_tags = label(dim=True)
+            self.d_why_h = label("Why it is interesting", cls="dg-section")
+            self.d_why = label(select=True, cls="dg-body")
+
+            self.d_exp_h = Gtk.Box(spacing=8)
+            self.d_exp_h.pack_start(label("Explanation", cls="dg-section", wrap=False), False, False, 0)
+            self.d_exp_spin = Gtk.Spinner()
+            self.d_exp_spin.set_margin_top(14)
+            self.d_exp_h.pack_start(self.d_exp_spin, False, False, 0)
+            self.d_exp = self.make_textview()
+
+            self.d_abs_h = label("Abstract", cls="dg-section")
+            self.d_abs = self.make_textview()
+
+            self.d_note_h = label("Note", cls="dg-section")
+            self.d_note = Gtk.Entry(placeholder_text="Add a short note…  (Enter to save)")
+            self.d_note.get_style_context().add_class("dg-note")
+            self.d_note.connect("activate", lambda *_: self.save_note())
+            self.d_note.connect("focus-out-event", lambda *_: self.save_note() or False)
+
+            for w in (self.d_title, self.d_metabox, self.d_tags, self.d_why_h, self.d_why, self.d_exp_h,
+                      self.d_exp, self.d_abs_h, self.d_abs, self.d_note_h, self.d_note):
+                body.pack_start(w, False, False, 0)
+            body.set_margin_start(6)
+            body.set_margin_end(6)
+            sw.add(Clamp(body, MAX_W))
+            outer.pack_start(sw, True, True, 0)
+            self.d_scroll = sw
+
+            actions = Gtk.Box(spacing=8)
+            self.b_open = Gtk.Button()
+            self.b_open.connect("clicked", lambda *_: self.open_url(self.current["link"]))
+            self.b_pdf = Gtk.Button(label="PDF")
+            self.b_pdf.set_tooltip_text("Download to your papers folder and open it (P)")
+            self.b_pdf.connect("clicked", lambda *_: self.open_pdf())
+            self.b_explain = Gtk.Button(label="Explain")
+            self.b_explain.set_tooltip_text("Claude explains the paper at your level (E)")
+            self.b_explain.connect("clicked", lambda *_: self.explain())
+            self.b_ask = Gtk.Button(label="Ask Claude")
+            self.b_ask.set_tooltip_text("Open a Claude chat about this paper (A)")
+            self.b_ask.connect("clicked", lambda *_: self.ask_claude())
+            for b in (self.b_open, self.b_pdf, self.b_explain, self.b_ask):
+                actions.pack_start(b, False, False, 0)
+            b_copy = Gtk.Button(label="Copy link")
+            b_copy.connect("clicked", lambda *_: self.copy(self.current["link"], "Link copied"))
+            self.b_bib = Gtk.Button(label="BibTeX")
+            self.b_bib.set_tooltip_text("Copy a BibTeX entry (B)")
+            self.b_bib.connect("clicked", lambda *_: self.copy_bibtex())
+            actions.pack_end(b_copy, False, False, 0)
+            actions.pack_end(self.b_bib, False, False, 0)
+            outer.pack_start(actions, False, False, 0)
+            self.d_status = label(dim=True, wrap=False)
+            outer.pack_start(self.d_status, False, False, 0)
+            return outer
+
+        def make_textview(self):
+            tv = Gtk.TextView()
+            tv.set_editable(False)
+            tv.set_cursor_visible(False)
+            tv.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+            tv.set_pixels_inside_wrap(5)
+            tv.set_pixels_below_lines(8)
+            tv.get_style_context().add_class("dg-body")
+            tv.last_w = 0
+
+            def on_alloc(view, alloc):
+                # GTK3 text views keep a height computed for an old width; re-measure when the width changes
+                if alloc.width != view.last_w:
+                    view.last_w = alloc.width
+                    GLib.idle_add(lambda: self.relayout(view) and False)
+            tv.connect("size-allocate", on_alloc)
+            return tv
+
+        def relayout(self, tv):
+            buf = tv.get_buffer()
+            buf.begin_user_action()
+            end = buf.get_end_iter()
+            buf.insert(end, " ")
+            end = buf.get_end_iter()
+            start = end.copy()
+            start.backward_char()
+            buf.delete(start, end)
+            buf.end_user_action()
+            tv.queue_resize()
+
+        def fill_text(self, tv, text):
+            """Text with $...$ math drawn as LaTeX (readable Unicode if rendering fails)."""
+            buf = tv.get_buffer()
+            buf.set_text("")
+            rgba = tv.get_style_context().get_color(Gtk.StateFlags.NORMAL)
+            color = "#%02x%02x%02x" % (int(rgba.red * 255), int(rgba.green * 255), int(rgba.blue * 255))
+            last = 0
+            for m in MATH.finditer(text):
+                buf.insert(buf.get_end_iter(), text[last:m.start()])
+                tex = next(g for g in m.groups() if g is not None)
+                res = render_math(tex, color, 13)
+                if res is not None:
+                    pix, depth = res
+                    start = buf.get_end_iter().get_offset()
+                    buf.insert_pixbuf(buf.get_end_iter(), pix)
+                    if depth:
+                        tag = buf.create_tag(None, rise=-depth * Pango.SCALE)
+                        buf.apply_tag(tag, buf.get_iter_at_offset(start), buf.get_end_iter())
+                else:
+                    buf.insert_markup(buf.get_end_iter(), tex_to_markup(tex), -1)
+                last = m.end()
+            buf.insert(buf.get_end_iter(), text[last:])
+
+        def show_detail(self, item_id):
+            it = self.app.store.get(item_id)
+            if it is None:
+                return
+            self.app.store.mark_read(item_id)
+            self.current = self.app.store.get(item_id)
+            it = self.current
+            self.d_title.set_markup(text_to_markup(it["title"] or "(untitled)"))
+            for ch in self.d_metabox.get_children():
+                self.d_metabox.remove(ch)
+            if it["level"]:
+                self.d_metabox.pack_start(level_pill(it["level"]), False, False, 0)
+            self.d_meta.set_text(meta_text(it).replace("  ·  ✎ note", ""))
+            self.d_metabox.pack_start(self.d_meta, True, True, 0)
+            self.d_metabox.show_all()
+            tags = it["tags"] if it["kind"] == "paper" else ""
+            self.d_tags.set_markup("<small>" + GLib.markup_escape_text(tags) + "</small>" if tags else "")
+            self.d_tags.set_visible(bool(tags))
+            self.d_why_h.set_visible(bool(it["why"]))
+            self.d_why.set_visible(bool(it["why"]))
+            self.d_why.set_markup(text_to_markup(it["why"] or ""))
+            self.show_explanation(it["explain"])
+            self.d_exp_spin.stop()
+            text = it["summary"] or ""
+            self.d_abs_h.set_text("Summary" if it["kind"] == "news" else "Abstract")
+            self.d_abs_h.set_visible(bool(text))
+            self.d_abs.set_visible(bool(text))
+            self.fill_text(self.d_abs, text)
+            self.d_note.set_text(it["note"] or "")
+            is_paper = bool(arxiv_id(it["link"]))
+            self.b_open.set_label("arXiv" if is_paper else "Open")
+            self.b_open.set_tooltip_text("Open the page in your browser (O)")
+            for b in (self.b_pdf, self.b_bib, self.b_explain):
+                b.set_visible(is_paper)
+            self.update_save_button()
+            self.d_status.set_text("")
+            self.d_scroll.get_vadjustment().set_value(0)
+            self.pages.set_visible_child_name("detail")
+            self.update_status()
+
+        def show_explanation(self, text):
+            has = bool(text)
+            self.d_exp_h.set_visible(has)
+            self.d_exp.set_visible(has)
+            if has:
+                self.fill_text(self.d_exp, text)
+
+        def update_save_button(self):
+            saved = bool(self.current and self.current["saved"])
+            self.d_save.set_label("★  Saved" if saved else "☆  Save")
+            self.d_save.set_tooltip_text("Remove from Saved (S)" if saved else "Save for later (S)")
+
+        def show_list(self):
+            keep = self.current["id"] if self.current else None
+            self.save_note()
+            self.current = None
+            self.pages.set_visible_child_name("list")
+            self.reload(keep=keep)
+
+        # ================================================================ actions
+        def in_detail(self):
+            return self.pages.get_visible_child_name() == "detail"
+
+        def say(self, msg):
+            if self.in_detail():
+                self.d_status.set_text(msg)
+            else:
+                self.update_status(note=msg)
+
+        def open_url(self, url):
+            if url:
+                subprocess.Popen(["xdg-open", url], start_new_session=True,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        def copy(self, text, msg):
+            Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(text, -1)
+            self.say(msg)
+
+        def toggle_save(self, item_id):
+            it = self.app.store.get(item_id)
+            if it is None:
+                return
+            self.app.store.set_field(item_id, "saved", 0 if it["saved"] else 1)
+            if self.in_detail() and self.current and self.current["id"] == item_id:
+                self.current = self.app.store.get(item_id)
+                self.update_save_button()
+                self.say("Saved" if self.current["saved"] else "Removed from Saved")
+            else:
+                self.reload(keep=item_id)
+
+        def save_note(self):
+            if self.current is None:
+                return
+            text = self.d_note.get_text().strip()
+            if text != (self.current["note"] or ""):
+                self.app.store.set_field(self.current["id"], "note", text)
+                self.current = self.app.store.get(self.current["id"])
+                self.say("Note saved")
+
+        def delete(self, item_id):
+            self.app.store.dismiss(item_id)
+            if self.in_detail():
+                self.current = None
+                self.pages.set_visible_child_name("list")
+                self.reload()
+            else:
+                lb = self.current_list()
+                rows = lb.get_children()
+                ids = [r.item_id for r in rows]
+                nxt = ids[ids.index(item_id) + 1] if item_id in ids and ids.index(item_id) + 1 < len(ids) else None
+                self.reload(keep=nxt)
+
+        def restore(self):
+            n = self.app.store.restore_latest()
+            self.reload()
+            self.update_status(note=f"Restored {n} item{'s' if n != 1 else ''}")
+
+        def open_pdf(self):
+            it = self.current
+            aid = arxiv_id(it["link"]) if it else None
+            if not aid:
+                return
+            folder = os.path.expanduser(self.app.cfg.get("papers_dir", "~/Papers"))
+            short = re.sub(r"[^\w\- ]", "", it["title"])[:60].strip()
+            path = os.path.join(folder, f"{aid.replace('/', '_')} - {short}.pdf")
+            if os.path.exists(path):
+                self.open_url(path)
+                self.say(f"Opened {os.path.basename(path)}")
+                return
+            self.say("Downloading PDF…")
+            self.b_pdf.set_sensitive(False)
+
+            def work():
+                os.makedirs(folder, exist_ok=True)
+                data = fetch(f"https://arxiv.org/pdf/{aid}")
+                if not data.startswith(b"%PDF"):
+                    raise ValueError("arXiv did not return a PDF")
+                with open(path + ".part", "wb") as f:
+                    f.write(data)
+                os.replace(path + ".part", path)
+                return path
+
+            def done(r):
+                self.b_pdf.set_sensitive(True)
+                if isinstance(r, Exception):
+                    self.say("Download failed, opening in the browser instead")
+                    self.open_url(f"https://arxiv.org/pdf/{aid}")
+                else:
+                    self.open_url(r)
+                    self.say(f"Saved to {folder.replace(HOME, '~')}")
+            run_bg(work, done)
+
+        def copy_bibtex(self):
+            it = self.current
+            aid = arxiv_id(it["link"]) if it else None
+            if not aid:
+                return
+            if it["bibtex"]:
+                self.copy(it["bibtex"], "BibTeX copied")
+                return
+            self.say("Getting BibTeX…")
+            item_id = it["id"]
+
+            def work():
+                txt = fetch(f"https://arxiv.org/bibtex/{aid}").decode("utf-8", "replace").strip()
+                if not txt.startswith("@"):
+                    raise ValueError("no BibTeX")
+                return txt
+
+            def done(r):
+                bib = fallback_bibtex(it) if isinstance(r, Exception) else r
+                self.app.store.set_field(item_id, "bibtex", bib)
+                if self.current and self.current["id"] == item_id:
+                    self.current = self.app.store.get(item_id)
+                self.copy(bib, "BibTeX copied" + (" (built locally)" if isinstance(r, Exception) else ""))
+            run_bg(work, done)
+
+        def explain(self):
+            it = self.current
+            if not it or not arxiv_id(it["link"]):
+                return
+            if it["explain"]:
+                self.show_explanation(it["explain"])
+                return
+            if not shutil.which("claude"):
+                self.say("Explain needs Claude Code (the 'claude' command) to be installed and signed in")
+                return
+            item_id = it["id"]
+            self.b_explain.set_sensitive(False)
+            self.d_exp_h.set_visible(True)
+            self.d_exp_spin.start()
+            self.say("Claude is reading the abstract…")
+            prompt = (
+                "Reader profile: " + self.app.cfg.get("profile", "") + "\n\n"
+                f"Paper: {it['title']}\nAuthors: {it['authors']}\nAbstract: {it['summary']}\n\n"
+                "Explain this paper to this reader in 4-5 plain sentences: the question, the main idea, and why "
+                "it matters. Then add one line starting with 'Before reading:' listing the 2-4 concepts they "
+                "should be comfortable with. Use $...$ for any math. No headings, no bullet points, English only.")
+
+            def work():
+                r = subprocess.run(["claude", "-p", prompt], capture_output=True, text=True, timeout=300)
+                if r.returncode != 0 or not r.stdout.strip():
+                    raise RuntimeError(r.stderr.strip()[:200] or "no answer")
+                return r.stdout.strip()
+
+            def done(r):
+                self.b_explain.set_sensitive(True)
+                self.d_exp_spin.stop()
+                if isinstance(r, Exception):
+                    self.d_exp_h.set_visible(False)
+                    self.say(f"Explain failed: {r}")
+                    return
+                self.app.store.set_field(item_id, "explain", r)
+                if self.current and self.current["id"] == item_id:
+                    self.current = self.app.store.get(item_id)
+                    self.show_explanation(r)
+                    self.say("")
+            run_bg(work, done)
+
+        def ask_claude(self):
+            it = self.current
+            if not it:
+                return
+            aid = arxiv_id(it["link"])
+            prompt = (f"I'd like to discuss this paper: \"{it['title']}\" by {it['authors']}.\n"
+                      f"Link: {it['link']}\n" + (f"PDF: https://arxiv.org/pdf/{aid}\n" if aid else "") +
+                      "Please read it first. About me: " + self.app.cfg.get("profile", "") + "\n"
+                      "Give me a short overview of the main result and how it is obtained, "
+                      "then I'll ask my questions.")
+            Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(prompt, -1)
+            url = self.app.cfg.get("ask_claude_url", "https://claude.ai/new?q={prompt}")
+            self.open_url(url.replace("{prompt}", urllib.parse.quote(prompt)))
+            self.say("Opening Claude… the message is also on your clipboard (Ctrl+V if the box is empty)")
+
+        # ================================================================ keys & refresh
+        def on_key(self, _w, ev):
+            focus = self.get_focus()
+            typing = isinstance(focus, Gtk.Entry) or (isinstance(focus, Gtk.TextView) and focus.get_editable())
+            ctrl = ev.state & Gdk.ModifierType.CONTROL_MASK
+            k = ev.keyval
+            if k == Gdk.KEY_Escape:
+                if typing and focus is self.search and self.search.get_text():
+                    self.search.set_text("")
+                elif self.in_detail():
+                    self.show_list()
+                else:
+                    self.close()
+                return True
+            if ctrl and k in (Gdk.KEY_f, Gdk.KEY_F) and not self.in_detail():
+                self.search.grab_focus()
+                return True
+            if ctrl and k in (Gdk.KEY_r, Gdk.KEY_R):
+                self.refresh()
+                return True
+            if typing or ctrl:
+                return False
+            ch = Gdk.keyval_to_unicode(k)
+            ch = chr(ch).lower() if ch else ""
+            sel = None
+            if not self.in_detail():
+                row = self.current_list().get_selected_row()
+                sel = row.item_id if row else None
+            if ch == "j":
+                self.move(1) if not self.in_detail() else None
+            elif ch == "k":
+                self.move(-1) if not self.in_detail() else None
+            elif k == Gdk.KEY_Delete:
+                target = self.current["id"] if self.in_detail() and self.current else sel
+                if target:
+                    self.delete(target)
+            elif ch == "s":
+                target = self.current["id"] if self.in_detail() and self.current else sel
+                if target:
+                    self.toggle_save(target)
+            elif self.in_detail() and ch in ("o", "p", "e", "b", "a"):
+                {"o": lambda: self.open_url(self.current["link"]), "p": self.open_pdf, "e": self.explain,
+                 "b": self.copy_bibtex, "a": self.ask_claude}[ch]()
+            elif not self.in_detail() and ch == "o" and sel:
+                it = self.app.store.get(sel)
+                self.app.store.mark_read(sel)
+                self.open_url(it["link"])
+                self.reload(keep=sel)
+            else:
+                return False
+            return True
+
+        def refresh(self):
+            if self.fetching:
+                return
+            self.fetching = True
+            self.update_status()
+
+            def work():
+                return locked_fetch(load_conf(), Store(DB), lambda m: print(m, file=sys.stderr))
+
+            def done(_r):
+                self.fetching = False
+                if self.in_detail():
+                    self.update_status()
+                else:
+                    self.reload()
+            run_bg(work, done)
+
+    class DigestApp(Gtk.Application):
+        def __init__(self):
+            super().__init__(application_id="org.physicsdigest.PhysicsDigest",
+                             flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE)
+            self.window = None
+
+        def do_startup(self):
+            Gtk.Application.do_startup(self)
+            self.cfg = load_conf()
+            self.store = Store(DB)
+
+        def do_command_line(self, cl):
+            args = cl.get_arguments()[1:]
+            if self.window is None:
+                self.window = DigestWindow(self)
+                self.window.connect("destroy", lambda *_: setattr(self, "window", None))
+            if "--show" in args and args.index("--show") + 1 < len(args):
+                self.window.show_detail(args[args.index("--show") + 1])
+            elif "--tab" in args and args.index("--tab") + 1 < len(args):
+                if self.window.in_detail():
+                    self.window.show_list()
+                self.window.tabs.set_visible_child_name(args[args.index("--tab") + 1])
+            elif self.window.in_detail():
+                self.window.show_list()
+            self.window.present()
+            return 0
+
+    return DigestApp().run(sys.argv)
+
+
+if __name__ == "__main__":
+    a = sys.argv[1:]
+    if "--version" in a:
+        print(f"physics-digest {__version__}")
+    elif "--daemon" in a:
+        main_daemon()
+    elif "--refresh" in a:
+        if not call_daemon("Refresh"):
+            print("Background service is not running; fetching here instead.")
+            print(locked_fetch(load_conf(), Store(DB)) and "done")
+    elif "--quit" in a:
+        print("stopped" if call_daemon("Quit") else "Background service is not running.")
+    elif "--restore" in a:
+        st = Store(DB)
+        n = st.restore_latest()
+        write_unread(st, load_conf())
+        print(f"Restored {n} item(s).")
+    elif "--reset" in a:
+        for f in (DB, os.path.join(CACHE, "unread")):
+            if os.path.exists(f):
+                os.remove(f)
+        print("Physics Digest reset. The next check fetches the current arXiv listing again.")
+    elif "--fetch-once" in a:
+        r = locked_fetch(load_conf(), Store(DB))
+        print(json.dumps({k: len(v) for k, v in r.items()}) if r else "another fetch is running")
+    else:
+        sys.exit(main_gui())
